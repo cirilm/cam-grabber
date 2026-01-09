@@ -21,6 +21,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Check secrets & variables
+        run: python check_env.py
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SUPABASE_BUCKET: ${{ secrets.SUPABASE_BUCKET }}
+          PAGE_URL: ${{ vars.PAGE_URL }}
+          CAMERA_ID: ${{ vars.CAMERA_ID }}
+          KEEP_LAST: ${{ vars.KEEP_LAST }}
+
+
       - name: Run grabber
         run: |
           python grab_and_store.py \
