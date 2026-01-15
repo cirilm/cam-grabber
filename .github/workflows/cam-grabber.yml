@@ -50,7 +50,9 @@ jobs:
           echo "PAGE_URL=[$PAGE_URL]"
           echo "CAMERA_ID=[$CAMERA_ID]"
           echo "KEEP_LAST=[$KEEP_LAST]"
-          python grab_and_store.py \
-            --page-url "$PAGE_URL" \
-            --camera-id "$CAMERA_ID" \
-            --keep-last "$KEEP_LAST"
+         python grab_and_store.py \
+          --page-url "$PAGE_URL" \
+          --camera-id "$CAMERA_ID" \
+          --keep-last "$KEEP_LAST" \
+          --timeout 60 \
+          --retries 6
