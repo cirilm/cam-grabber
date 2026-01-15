@@ -8,11 +8,14 @@ on:
 jobs:
   grab:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
+    timeout-minutes: 10
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -21,8 +24,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Debug variables (safe)
+        env:
+          PAGE_URL: ${{ vars.PAGE_URL }}
+          CAMERA_ID: ${{ vars.CAMERA_ID }}
+          KEEP_LAST: ${{ vars.KEEP_LAST }}
+        run: |
+          echo "PAGE_URL=[$PAGE_URL]"
+          echo "CAMERA_ID=[$CAMERA_ID]"
+          echo "KEEP_LAST=[$KEEP_LAST]"
+
       - name: Check secrets & variables
-        run: python check_env.py
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
@@ -30,15 +42,16 @@ jobs:
           PAGE_URL: ${{ vars.PAGE_URL }}
           CAMERA_ID: ${{ vars.CAMERA_ID }}
           KEEP_LAST: ${{ vars.KEEP_LAST }}
+        run: python check_env.py
 
       - name: Check Supabase (DB + Storage)
-        run: python check_supabase.py
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           SUPABASE_BUCKET: ${{ secrets.SUPABASE_BUCKET }}
-     
-      - name: Run grabber
+        run: python check_supabase.py
+
+      - name: Grab + upload
         env:
           PAGE_URL: ${{ vars.PAGE_URL }}
           CAMERA_ID: ${{ vars.CAMERA_ID }}
@@ -47,12 +60,9 @@ jobs:
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           SUPABASE_BUCKET: ${{ secrets.SUPABASE_BUCKET }}
         run: |
-          echo "PAGE_URL=[$PAGE_URL]"
-          echo "CAMERA_ID=[$CAMERA_ID]"
-          echo "KEEP_LAST=[$KEEP_LAST]"
-         python grab_and_store.py \
-          --page-url "$PAGE_URL" \
-          --camera-id "$CAMERA_ID" \
-          --keep-last "$KEEP_LAST" \
-          --timeout 60 \
-          --retries 6
+          python grab_and_store.py \
+            --page-url "$PAGE_URL" \
+            --camera-id "$CAMERA_ID" \
+            --keep-last "$KEEP_LAST" \
+            --timeout 60 \
+            --retries 6
