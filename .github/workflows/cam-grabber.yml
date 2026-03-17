@@ -63,6 +63,6 @@ jobs:
           python grab_and_store.py \
             --page-url "$PAGE_URL" \
             --camera-id "$CAMERA_ID" \
-            --keep-last "$KEEP_LAST" \
+            ${KEEP_LAST:+--keep-last "$KEEP_LAST"} \
             --timeout 120 \
             --retries 6

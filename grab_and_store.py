@@ -174,7 +174,7 @@ def main() -> int:
     ap.add_argument("--retries", type=int, default=5, help="HTTP retry count for transient failures.")
     ap.add_argument("--user-agent", default="cam-grabber/1.0 (+github-actions)", help="User-Agent header.")
     ap.add_argument("--bucket", default=os.environ.get("SUPABASE_BUCKET", "camframes"), help="Supabase Storage bucket.")
-    ap.add_argument("--keep-last", type=int, default=int(os.environ.get("KEEP_LAST", "100")),
+    ap.add_argument("--keep-last", type=int, default=int(os.environ.get("KEEP_LAST") or "100"),
                     help="How many latest frames to keep per camera (default 100). Use 0 to disable cleanup.")
     args = ap.parse_args()
 

@@ -41,8 +41,9 @@ def main():
     if not os.environ["PAGE_URL"].startswith("http"):
         fail("PAGE_URL does not look like a valid URL")
 
+    keep_last = os.environ.get("KEEP_LAST") or "100"
     try:
-        int(os.environ.get("KEEP_LAST", "100"))
+        int(keep_last)
     except ValueError:
         fail("KEEP_LAST must be an integer")
 
