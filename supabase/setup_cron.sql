@@ -12,6 +12,7 @@ select cron.schedule(
     url    := '<YOUR_SUPABASE_URL>/functions/v1/cam-grabber',
     headers := jsonb_build_object(
       'Authorization', 'Bearer <YOUR_SERVICE_ROLE_KEY>',
+      'apikey',        '<YOUR_SERVICE_ROLE_KEY>',
       'Content-Type',  'application/json'
     ),
     body   := '{}'::jsonb
