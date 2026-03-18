@@ -88,6 +88,49 @@ export SUPABASE_BUCKET="camframes"
 python grab_and_store.py --page-url "https://example.com/cam.php" --camera-id "betina_cam4"
 ```
 
+## 6) Supabase Edge Function (recommended)
+
+For reliable 5-minute intervals, use the included Supabase Edge Function instead of (or alongside) GitHub Actions.
+
+### A) Set Edge Function secrets
+
+In Supabase Dashboard → **Edge Functions → Manage Secrets**, add:
+
+- `PAGE_URL` – the page URL you want to grab from
+- `CAMERA_ID` – e.g. `betina_cam4`
+- `KEEP_LAST` – e.g. `100` (optional, defaults to 100)
+- `SUPABASE_BUCKET` – e.g. `camframes` (optional, defaults to camframes)
+
+> `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are available automatically in Edge Functions.
+
+### B) Deploy the Edge Function
+
+```bash
+# Install Supabase CLI if you haven't already
+npm install -g supabase
+
+# Login and link your project
+supabase login
+supabase link --project-ref <your-project-ref>
+
+# Deploy the function
+supabase functions deploy cam-grabber --no-verify-jwt
+```
+
+### C) Schedule with pg_cron (every 5 minutes)
+
+Run the SQL in `supabase/setup_cron.sql` in the **SQL Editor**, replacing the placeholder values with your actual Supabase URL and service role key.
+
+This uses `pg_cron` + `pg_net` to call the Edge Function every 5 minutes directly from Postgres — no external scheduler needed.
+
+### D) Test manually
+
+```bash
+curl -X POST "https://<your-project>.supabase.co/functions/v1/cam-grabber" \
+  -H "Authorization: Bearer <your-service-role-key>" \
+  -H "Content-Type: application/json"
+```
+
 ## Notes
 - This project intentionally **stores images in Storage** and only stores **metadata** in Postgres.
-- GitHub Actions schedules can drift by ~minutes; for strict timing, use a VPS cron.
+- GitHub Actions schedules can drift by ~minutes; the Edge Function + pg_cron approach is more reliable.
