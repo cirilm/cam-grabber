@@ -9,11 +9,11 @@ select cron.schedule(
   '*/5 * * * *',              -- every 5 minutes
   $$
   select net.http_post(
-    url    := '<YOUR_SUPABASE_URL>/functions/v1/cam-grabber',
-    headers := jsonb_build_object(
-      'Authorization', 'Bearer <YOUR_SERVICE_ROLE_KEY>',
-      'Content-Type',  'application/json'
-    ),
+    url    := '<SUPABASE_URL>/functions/v1/cam-grabber',
+  headers := jsonb_build_object(
+  'Authorization', 'Bearer <SUPABASE_SERVICE_ROLE_KEY>',  -- replace this
+  'Content-Type',  'application/json'
+),
     body   := '{}'::jsonb
   );
   $$
