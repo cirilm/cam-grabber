@@ -113,6 +113,20 @@ Deno.serve(async (req) => {
   }
 
   try {
+    // Validate required env vars
+    if (!PAGE_URL) {
+      return new Response(
+        JSON.stringify({ ok: false, error: "Missing required env var: PAGE_URL. Set it in Edge Function secrets." }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) {
+      return new Response(
+        JSON.stringify({ ok: false, error: "Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY env vars." }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
     // 1. Fetch the image
     const imgBytes = await fetchImageBytes(PAGE_URL);
 
