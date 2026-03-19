@@ -1,136 +1,77 @@
-# Cam Grabber → Supabase (Storage + DB)
+# cam-grabber
 
-This repo runs a small Python “webcam grabber” every **5 minutes** via **GitHub Actions**.
-It downloads the latest image from a webpage, uploads it to **Supabase Storage**, writes metadata to **Supabase Postgres**, and keeps only the **latest N** frames (default: 100) per camera.
+`cam-grabber` now runs as a Supabase Edge Function instead of a GitHub Actions job.
 
-## 1) Supabase setup
+## Source of truth
 
-### A) Create a Storage bucket
-Create a bucket, e.g. `camframes`.
+The GitHub repo owns:
 
-- **Public bucket (simplest):** images are directly accessible by URL.
-- **Private bucket (more secure):** you’ll later generate signed URLs (not implemented here by default).
+- Edge Function code in `supabase/functions/cam-grabber/index.ts`
+- database schema in `supabase/migrations/`
+- function configuration in `supabase/config.toml`
+- scheduler SQL in `supabase/setup_cron.sql`
 
-### B) Create the metadata table
-Run this in Supabase SQL Editor:
+The active hosted Supabase project used during review was `dyzwgcwzxhkfwgzafetl`, and its live state matched this repo shape:
 
-```sql
-create table if not exists camera_frames (
-  id bigserial primary key,
-  camera_id text not null,
-  ts timestamptz not null default now(),
-  object_path text not null,
-  public_url text,
-  content_hash text
-);
+- storage bucket: `camframes`
+- table: `public.camera_frames`
+- primary index: `camera_frames_cam_ts`
+- active function slug: `cam-grabber`
 
-create index if not exists camera_frames_cam_ts
-  on camera_frames (camera_id, ts desc);
-```
+## Required Edge Function secrets
 
-Optional (light dedupe):
-```sql
-create unique index if not exists camera_frames_cam_hash_unique
-  on camera_frames (camera_id, content_hash);
-```
+Set these in Supabase before deploying:
 
-## 2) GitHub repo setup
+- `PAGE_URL`
+- `CAMERA_ID`
+- `KEEP_LAST`
+- `SUPABASE_BUCKET`
 
-### A) Add GitHub *Secrets*
-In your GitHub repo: **Settings → Secrets and variables → Actions → New repository secret**
+Optional but recommended:
 
-- `SUPABASE_URL` – your project URL
-- `SUPABASE_SERVICE_ROLE_KEY` – **service role key** (keep it secret; do not put in mobile apps)
+- `CRON_SECRET`
 
-Optional:
-- `SUPABASE_BUCKET` – defaults to `camframes`
+Hosted Edge Functions already provide `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY`.
 
-### B) Add GitHub *Variables* (repo variables)
-**Settings → Secrets and variables → Actions → Variables**
-
-- `PAGE_URL` – the page URL you want to grab from
-- `CAMERA_ID` – e.g. `betina_cam4`
-- `KEEP_LAST` – e.g. `100` (optional)
-
-## 3) Run it
-
-- It will run automatically every 5 minutes.
-- You can also run it manually: **Actions → cam-grabber → Run workflow**.
-
-## 4) Reading the “stream” on mobile
-
-If the bucket is **public**, the `public_url` field in `camera_frames` is a direct image URL.
-To fetch the latest 100 frames for a camera:
-
-```sql
-select ts, public_url
-from camera_frames
-where camera_id = 'betina_cam4'
-order by ts desc
-limit 100;
-```
-
-You can query from:
-- Supabase dashboard (quick check), or
-- any mobile/web UI you build later.
-
-## 5) Local run (optional)
+## Deploy
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-export SUPABASE_URL="..."
-export SUPABASE_SERVICE_ROLE_KEY="..."
-export SUPABASE_BUCKET="camframes"
-
-python grab_and_store.py --page-url "https://example.com/cam.php" --camera-id "betina_cam4"
+supabase link --project-ref dyzwgcwzxhkfwgzafetl
+supabase functions deploy cam-grabber
 ```
 
-## 6) Supabase Edge Function (recommended)
+Because `supabase/config.toml` sets `verify_jwt = false`, the function does its own authorization:
 
-For reliable 5-minute intervals, use the included Supabase Edge Function instead of (or alongside) GitHub Actions.
+- `Authorization: Bearer <SUPABASE_SERVICE_ROLE_KEY>`
+- or `x-cron-secret: <CRON_SECRET>` when `CRON_SECRET` is configured
 
-### A) Set Edge Function secrets
+## Schema sync
 
-In Supabase Dashboard → **Edge Functions → Manage Secrets**, add:
-
-- `PAGE_URL` – the page URL you want to grab from
-- `CAMERA_ID` – e.g. `betina_cam4`
-- `KEEP_LAST` – e.g. `100` (optional, defaults to 100)
-- `SUPABASE_BUCKET` – e.g. `camframes` (optional, defaults to camframes)
-
-> `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` are available automatically in Edge Functions.
-
-### B) Deploy the Edge Function
+The repo migration creates the extensions and table used by the function:
 
 ```bash
-# Install Supabase CLI if you haven't already
-npm install -g supabase
-
-# Login and link your project
-supabase login
-supabase link --project-ref <your-project-ref>
-
-# Deploy the function
-supabase functions deploy cam-grabber --no-verify-jwt
+supabase db push
 ```
 
-### C) Schedule with pg_cron (every 5 minutes)
+If you do not have a remote DB password configured locally yet, keep the migration in Git and apply it from the Supabase dashboard or after exporting `SUPABASE_DB_PASSWORD`.
 
-Run the SQL in `supabase/setup_cron.sql` in the **SQL Editor**, replacing the placeholder values with your actual Supabase URL and service role key.
+## Scheduler
 
-This uses `pg_cron` + `pg_net` to call the Edge Function every 5 minutes directly from Postgres — no external scheduler needed.
+The scheduler uses `pg_cron` + `pg_net`, with its URL and cron secret stored in Supabase Vault.
 
-### D) Test manually
+The repo migration creates the cron job from Vault-backed values:
 
 ```bash
-curl -X POST "https://<your-project>.supabase.co/functions/v1/cam-grabber" \
-  -H "Authorization: Bearer <your-service-role-key>" \
-  -H "Content-Type: application/json"
+supabase db push
 ```
 
-## Notes
-- This project intentionally **stores images in Storage** and only stores **metadata** in Postgres.
-- GitHub Actions schedules can drift by ~minutes; the Edge Function + pg_cron approach is more reliable.
+For a new environment, first create these Vault secrets from SQL:
+
+```sql
+create extension if not exists vault;
+
+select vault.create_secret('https://dyzwgcwzxhkfwgzafetl.supabase.co', 'project_url');
+select vault.create_secret('<CRON_SECRET>', 'cam_grabber_cron_secret');
+```
+
+Then apply [setup_cron.sql](/Users/cirilmlakar/Documents/New%20project/cam-grabber/supabase/setup_cron.sql#L1) or run `supabase db push`.

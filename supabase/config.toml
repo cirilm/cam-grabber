@@ -1,0 +1,4 @@
+project_id = "cam-grabber"
+
+[functions.cam-grabber]
+verify_jwt = false
