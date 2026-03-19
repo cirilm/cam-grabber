@@ -27,7 +27,7 @@ Set these in Supabase before deploying:
 - `KEEP_LAST`
 - `SUPABASE_BUCKET`
 
-Optional:
+Optional but recommended:
 
 - `CRON_SECRET`
 
@@ -57,6 +57,21 @@ If you do not have a remote DB password configured locally yet, keep the migrati
 
 ## Scheduler
 
-Run `supabase/setup_cron.sql` after replacing `<CRON_SECRET>` if you want Postgres to invoke the function every 5 minutes with `pg_cron` + `pg_net`.
+The scheduler uses `pg_cron` + `pg_net`, with its URL and cron secret stored in Supabase Vault.
 
-If you do not want to use `CRON_SECRET`, you can keep using a service-role bearer token in the HTTP headers instead, but the repo defaults to the safer cron-secret pattern.
+The repo migration creates the cron job from Vault-backed values:
+
+```bash
+supabase db push
+```
+
+For a new environment, first create these Vault secrets from SQL:
+
+```sql
+create extension if not exists vault;
+
+select vault.create_secret('https://dyzwgcwzxhkfwgzafetl.supabase.co', 'project_url');
+select vault.create_secret('<CRON_SECRET>', 'cam_grabber_cron_secret');
+```
+
+Then apply [setup_cron.sql](/Users/cirilmlakar/Documents/New%20project/cam-grabber/supabase/setup_cron.sql#L1) or run `supabase db push`.
