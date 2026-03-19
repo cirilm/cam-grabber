@@ -1,188 +1,299 @@
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
-import { crypto } from "https://deno.land/std@0.224.0/crypto/mod.ts";
-import { encodeHex } from "https://deno.land/std@0.224.0/encoding/hex.ts";
 
 const IMG_RE = /<img[^>]+src=["']([^"']+)["']/gi;
 const IMAGE_EXTENSIONS = [".jpg", ".jpeg", ".png", ".webp"];
+const RETRY_BACKOFF_MS = [0, 1500, 3000, 5000, 8000];
 
-const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
-const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-const PAGE_URL = Deno.env.get("PAGE_URL")!;
-const CAMERA_ID = Deno.env.get("CAMERA_ID") || "default_cam";
-const BUCKET = Deno.env.get("SUPABASE_BUCKET") || "camframes";
-const KEEP_LAST = parseInt(Deno.env.get("KEEP_LAST") || "100", 10);
+type FetchResult = {
+  bytes: Uint8Array;
+  contentType: string;
+  extension: string;
+};
 
-function pickImageSrc(html: string, baseUrl: string): string | null {
+function getRequiredEnv(name: string): string {
+  const value = Deno.env.get(name);
+  if (!value) {
+    throw new Error(`Missing required environment variable: ${name}`);
+  }
+  return value;
+}
+
+function json(status: number, body: Record<string, unknown>) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function parseKeepLast(value: unknown, fallback: string): number {
+  const raw = typeof value === "number" ? String(value) : String(value ?? fallback);
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`Invalid KEEP_LAST value: ${raw}`);
+  }
+  return parsed;
+}
+
+function sanitizeCameraId(cameraId: string): string {
+  return cameraId.replace(/[^a-zA-Z0-9._-]/g, "_");
+}
+
+function pickImageUrl(html: string, baseUrl: string): string | null {
   const matches = [...html.matchAll(IMG_RE)];
   if (matches.length === 0) return null;
 
-  // Prefer non-data URIs that look like images
-  for (const m of matches) {
-    const src = m[1];
+  for (const match of matches) {
+    const src = match[1];
     if (src.startsWith("data:")) continue;
     const path = src.split("?")[0].toLowerCase();
     if (IMAGE_EXTENSIONS.some((ext) => path.endsWith(ext))) {
       return new URL(src, baseUrl).href;
     }
   }
-  // Fallback to first non-data src
-  for (const m of matches) {
-    if (!m[1].startsWith("data:")) {
-      return new URL(m[1], baseUrl).href;
+
+  for (const match of matches) {
+    const src = match[1];
+    if (!src.startsWith("data:")) {
+      return new URL(src, baseUrl).href;
     }
   }
-  return matches[0][1];
+
+  return null;
 }
 
 function cacheBust(url: string): string {
-  const ts = new Date().toISOString().replace(/[-:T.Z]/g, "").slice(0, 14);
-  return url + (url.includes("?") ? "&" : "?") + `_cb=${ts}`;
+  const ts = new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
+  return `${url}${url.includes("?") ? "&" : "?"}_cb=${ts}`;
 }
 
-async function fetchImageBytes(pageUrl: string): Promise<Uint8Array> {
-  const headers: Record<string, string> = {
-    "User-Agent": "cam-grabber/1.0 (+supabase-edge)",
-    Accept:
-      "text/html,application/xhtml+xml,application/xml;q=0.9,image/*,*/*;q=0.8",
+function detectImageExtension(bytes: Uint8Array, contentType: string): string {
+  if (contentType.includes("png")) return "png";
+  if (contentType.includes("webp")) return "webp";
+  if (contentType.includes("jpeg") || contentType.includes("jpg")) return "jpg";
+
+  const jpeg = bytes.length >= 3 &&
+    bytes[0] === 0xff &&
+    bytes[1] === 0xd8 &&
+    bytes[2] === 0xff;
+  if (jpeg) return "jpg";
+
+  const png = bytes.length >= 4 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47;
+  if (png) return "png";
+
+  const riff = bytes.length >= 12 &&
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50;
+  if (riff) return "webp";
+
+  throw new Error(`Unsupported image format. content-type=${contentType || "unknown"}`);
+}
+
+async function delay(ms: number) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchWithRetry(url: string, headers: HeadersInit): Promise<Response> {
+  let lastError: unknown;
+
+  for (const backoffMs of RETRY_BACKOFF_MS) {
+    if (backoffMs > 0) {
+      await delay(backoffMs);
+    }
+
+    try {
+      const response = await fetch(url, {
+        headers,
+        redirect: "follow",
+        signal: AbortSignal.timeout(120_000),
+      });
+
+      if (response.ok) {
+        return response;
+      }
+
+      if (![429, 500, 502, 503, 504].includes(response.status)) {
+        throw new Error(`HTTP ${response.status} fetching ${url}`);
+      }
+
+      lastError = new Error(`Transient HTTP ${response.status} fetching ${url}`);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error("Unknown fetch failure");
+}
+
+async function fetchImage(pageUrl: string): Promise<FetchResult> {
+  const headers: HeadersInit = {
+    "User-Agent": "cam-grabber/2.0 (+supabase-edge)",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/*,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
   };
 
-  const resp = await fetch(pageUrl, { headers, redirect: "follow" });
-  if (!resp.ok) {
-    throw new Error(`HTTP ${resp.status} fetching ${pageUrl}`);
+  const pageResponse = await fetchWithRetry(pageUrl, headers);
+  const pageContentType = (pageResponse.headers.get("content-type") || "").toLowerCase();
+
+  if (pageContentType.startsWith("image/")) {
+    const bytes = new Uint8Array(await pageResponse.arrayBuffer());
+    const extension = detectImageExtension(bytes, pageContentType);
+    return {
+      bytes,
+      contentType: pageContentType || `image/${extension}`,
+      extension,
+    };
   }
 
-  const contentType = (resp.headers.get("content-type") || "").toLowerCase();
-
-  // Direct image response
-  if (contentType.startsWith("image/")) {
-    return new Uint8Array(await resp.arrayBuffer());
+  const html = await pageResponse.text();
+  const imageUrl = pickImageUrl(html, pageUrl);
+  if (!imageUrl) {
+    throw new Error("No <img src=...> found on PAGE_URL");
   }
 
-  // HTML page — extract <img src>
-  const html = await resp.text();
-  const imgUrl = pickImageSrc(html, pageUrl);
-  if (!imgUrl) {
-    throw new Error("No <img src=...> found on the page");
-  }
+  const imageResponse = await fetchWithRetry(cacheBust(imageUrl), headers);
+  const imageContentType = (imageResponse.headers.get("content-type") || "").toLowerCase();
+  const bytes = new Uint8Array(await imageResponse.arrayBuffer());
+  const extension = detectImageExtension(bytes, imageContentType);
 
-  const imgResp = await fetch(cacheBust(imgUrl), {
-    headers,
-    redirect: "follow",
-  });
-  if (!imgResp.ok) {
-    throw new Error(`HTTP ${imgResp.status} fetching image ${imgUrl}`);
-  }
-
-  const imgBytes = new Uint8Array(await imgResp.arrayBuffer());
-
-  // Validate it looks like an image
-  const imgCt = (imgResp.headers.get("content-type") || "").toLowerCase();
-  if (!imgCt.startsWith("image/")) {
-    const isJpeg =
-      imgBytes[0] === 0xff && imgBytes[1] === 0xd8 && imgBytes[2] === 0xff;
-    const isPng =
-      imgBytes[0] === 0x89 &&
-      imgBytes[1] === 0x50 &&
-      imgBytes[2] === 0x4e &&
-      imgBytes[3] === 0x47;
-    if (!isJpeg && !isPng) {
-      throw new Error(
-        `Extracted URL did not return an image. content-type=${imgCt}`
-      );
-    }
-  }
-
-  return imgBytes;
+  return {
+    bytes,
+    contentType: imageContentType || `image/${extension}`,
+    extension,
+  };
 }
 
-async function sha256hex(data: Uint8Array): Promise<string> {
-  const hash = await crypto.subtle.digest("SHA-256", data);
-  return encodeHex(new Uint8Array(hash)).slice(0, 16);
+async function sha256Short(bytes: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest))
+    .map((value) => value.toString(16).padStart(2, "0"))
+    .join("")
+    .slice(0, 16);
 }
 
-Deno.serve(async (req) => {
-  // Verify this is called by cron or with proper auth
-  const authHeader = req.headers.get("Authorization");
-  if (
-    authHeader !== `Bearer ${SUPABASE_SERVICE_ROLE_KEY}` &&
-    authHeader !== `Bearer ${Deno.env.get("ANON_KEY") || ""}`
-  ) {
-    // Allow calls from pg_cron (via pg_net) which use the service role key
-    // Also allow manual invocation with the anon key
+function isAuthorized(request: Request): boolean {
+  const serviceRoleKey = getRequiredEnv("SUPABASE_SERVICE_ROLE_KEY");
+  const authHeader = request.headers.get("authorization");
+  if (authHeader === `Bearer ${serviceRoleKey}`) {
+    return true;
+  }
+
+  const cronSecret = Deno.env.get("CRON_SECRET");
+  if (cronSecret && request.headers.get("x-cron-secret") === cronSecret) {
+    return true;
+  }
+
+  return false;
+}
+
+Deno.serve(async (request) => {
+  if (request.method !== "POST") {
+    return json(405, { ok: false, error: "Use POST" });
+  }
+
+  if (!isAuthorized(request)) {
+    return json(401, { ok: false, error: "Unauthorized" });
   }
 
   try {
-    // 1. Fetch the image
-    const imgBytes = await fetchImageBytes(PAGE_URL);
+    const payload = (request.headers.get("content-type")?.includes("application/json")
+      ? await request.json().catch(() => ({}))
+      : {}) as Record<string, unknown>;
 
-    // 2. Build storage path
+    const pageUrl = String(payload?.page_url ?? getRequiredEnv("PAGE_URL"));
+    const cameraId = sanitizeCameraId(
+      String(payload?.camera_id ?? Deno.env.get("CAMERA_ID") ?? "default_cam"),
+    );
+    const bucket = String(payload?.bucket ?? Deno.env.get("SUPABASE_BUCKET") ?? "camframes");
+    const keepLast = parseKeepLast(payload?.keep_last, Deno.env.get("KEEP_LAST") ?? "100");
+
+    const supabaseUrl = getRequiredEnv("SUPABASE_URL");
+    const serviceRoleKey = getRequiredEnv("SUPABASE_SERVICE_ROLE_KEY");
+    const supabase = createClient(supabaseUrl, serviceRoleKey);
+
+    const image = await fetchImage(pageUrl);
     const now = new Date();
-    const day = now.toISOString().slice(0, 10); // YYYY-MM-DD
-    const time = now.toISOString().slice(11, 19).replace(/:/g, "-"); // HH-MM-SS
-    const contentHash = await sha256hex(imgBytes);
-    const objectPath = `${CAMERA_ID}/${day}/${time}_${contentHash}.jpg`;
+    const day = now.toISOString().slice(0, 10);
+    const time = now.toISOString().slice(11, 19).replace(/:/g, "-");
+    const contentHash = await sha256Short(image.bytes);
+    const objectPath = `${cameraId}/${day}/${time}_${contentHash}.${image.extension}`;
 
-    // 3. Upload to Supabase Storage
-    const sb = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+    const upload = await supabase.storage.from(bucket).upload(objectPath, image.bytes, {
+      contentType: image.contentType || `image/${image.extension}`,
+      upsert: false,
+    });
+    if (upload.error) {
+      throw new Error(`Upload failed: ${upload.error.message}`);
+    }
 
-    const { error: uploadError } = await sb.storage
-      .from(BUCKET)
-      .upload(objectPath, imgBytes, {
-        contentType: "image/jpeg",
-        upsert: false,
-      });
-    if (uploadError) throw new Error(`Upload failed: ${uploadError.message}`);
-
-    // 4. Get public URL
     const {
       data: { publicUrl },
-    } = sb.storage.from(BUCKET).getPublicUrl(objectPath);
+    } = supabase.storage.from(bucket).getPublicUrl(objectPath);
 
-    // 5. Insert metadata row
-    const { error: insertError } = await sb
-      .from("camera_frames")
-      .insert({
-        camera_id: CAMERA_ID,
-        ts: now.toISOString(),
-        object_path: objectPath,
-        public_url: publicUrl,
-        content_hash: contentHash,
-      });
-    if (insertError) throw new Error(`DB insert failed: ${insertError.message}`);
+    const insert = await supabase.from("camera_frames").insert({
+      camera_id: cameraId,
+      ts: now.toISOString(),
+      object_path: objectPath,
+      public_url: publicUrl,
+      content_hash: contentHash,
+    });
 
-    // 6. Cleanup old frames
-    if (KEEP_LAST > 0) {
-      const { data: oldRows } = await sb
+    if (insert.error) {
+      await supabase.storage.from(bucket).remove([objectPath]);
+      throw new Error(`DB insert failed: ${insert.error.message}`);
+    }
+
+    if (keepLast > 0) {
+      const oldRows = await supabase
         .from("camera_frames")
         .select("id, object_path")
-        .eq("camera_id", CAMERA_ID)
+        .eq("camera_id", cameraId)
         .order("ts", { ascending: false })
-        .range(KEEP_LAST, KEEP_LAST + 500);
+        .range(keepLast, keepLast + 499);
 
-      if (oldRows && oldRows.length > 0) {
-        const oldPaths = oldRows.map((r: { object_path: string }) => r.object_path);
-        const oldIds = oldRows.map((r: { id: number }) => r.id);
+      if (oldRows.error) {
+        throw new Error(`Cleanup query failed: ${oldRows.error.message}`);
+      }
 
-        await sb.storage.from(BUCKET).remove(oldPaths);
-        await sb.from("camera_frames").delete().in("id", oldIds);
+      if (oldRows.data && oldRows.data.length > 0) {
+        const oldPaths = oldRows.data.map((row) => row.object_path);
+        const oldIds = oldRows.data.map((row) => row.id);
+
+        const remove = await supabase.storage.from(bucket).remove(oldPaths);
+        if (remove.error) {
+          throw new Error(`Storage cleanup failed: ${remove.error.message}`);
+        }
+
+        const removeRows = await supabase.from("camera_frames").delete().in("id", oldIds);
+        if (removeRows.error) {
+          throw new Error(`DB cleanup failed: ${removeRows.error.message}`);
+        }
       }
     }
 
-    return new Response(
-      JSON.stringify({
-        ok: true,
-        ts: now.toISOString(),
-        object_path: objectPath,
-        public_url: publicUrl,
-      }),
-      { headers: { "Content-Type": "application/json" } }
-    );
-  } catch (err) {
-    console.error("[cam-grabber]", err);
-    return new Response(
-      JSON.stringify({ ok: false, error: (err as Error).message }),
-      { status: 500, headers: { "Content-Type": "application/json" } }
-    );
+    return json(200, {
+      ok: true,
+      ts: now.toISOString(),
+      camera_id: cameraId,
+      object_path: objectPath,
+      public_url: publicUrl,
+      content_hash: contentHash,
+      bucket,
+    });
+  } catch (error) {
+    console.error("[cam-grabber]", error);
+    return json(500, {
+      ok: false,
+      error: error instanceof Error ? error.message : "Unknown error",
+    });
   }
 });

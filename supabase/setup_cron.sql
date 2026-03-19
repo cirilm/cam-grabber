@@ -1,26 +1,24 @@
--- Enable required extensions (run once in Supabase SQL Editor)
 create extension if not exists pg_cron;
 create extension if not exists pg_net;
 
--- Schedule the edge function to run every 5 minutes.
--- Replace <YOUR_SUPABASE_URL> and <YOUR_SERVICE_ROLE_KEY> with actual values.
+select cron.unschedule('cam-grabber-every-5min')
+where exists (
+  select 1
+  from cron.job
+  where jobname = 'cam-grabber-every-5min'
+);
+
 select cron.schedule(
-  'cam-grabber-every-5min',   -- unique job name
-  '*/5 * * * *',              -- every 5 minutes
+  'cam-grabber-every-5min',
+  '*/5 * * * *',
   $$
   select net.http_post(
-    url    := '<SUPABASE_URL>/functions/v1/cam-grabber',
-  headers := jsonb_build_object(
-  'Authorization', 'Bearer <SUPABASE_SERVICE_ROLE_KEY>',  -- replace this
-  'Content-Type',  'application/json'
-),
-    body   := '{}'::jsonb
+    url := 'https://dyzwgcwzxhkfwgzafetl.supabase.co/functions/v1/cam-grabber',
+    headers := jsonb_build_object(
+      'Content-Type', 'application/json',
+      'x-cron-secret', '<CRON_SECRET>'
+    ),
+    body := jsonb_build_object('source', 'pg_cron')
   );
   $$
 );
-
--- To verify the job was created:
--- select * from cron.job;
-
--- To remove the job later:
--- select cron.unschedule('cam-grabber-every-5min');
