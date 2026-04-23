@@ -2,3 +2,9 @@ project_id = "cam-grabber"
 
 [functions.cam-grabber]
 verify_jwt = false
+
+[functions.weather-grabber]
+verify_jwt = false
+
+[functions.sea-temperature-grabber]
+verify_jwt = false

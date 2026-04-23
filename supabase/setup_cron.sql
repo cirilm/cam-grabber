@@ -1,6 +1,5 @@
 create extension if not exists pg_cron;
 create extension if not exists pg_net;
-create extension if not exists vault;
 
 select cron.unschedule('cam-grabber-every-5min')
 where exists (
@@ -9,16 +8,59 @@ where exists (
   where jobname = 'cam-grabber-every-5min'
 );
 
+select cron.unschedule('weather-grabber-every-10min')
+where exists (
+  select 1
+  from cron.job
+  where jobname = 'weather-grabber-every-10min'
+);
+
+select cron.unschedule('sea-temperature-grabber-hourly')
+where exists (
+  select 1
+  from cron.job
+  where jobname = 'sea-temperature-grabber-hourly'
+);
+
 select cron.schedule(
   'cam-grabber-every-5min',
   '*/5 * * * *',
   $$
   select net.http_post(
-    url := (select decrypted_secret from vault.decrypted_secrets where name = 'project_url')
-      || '/functions/v1/cam-grabber',
+    url := 'https://dyzwgcwzxhkfwgzafetl.supabase.co/functions/v1/cam-grabber',
     headers := jsonb_build_object(
       'Content-Type', 'application/json',
-      'x-cron-secret', (select decrypted_secret from vault.decrypted_secrets where name = 'cam_grabber_cron_secret')
+      'x-cron-secret', '<CRON_SECRET>'
+    ),
+    body := jsonb_build_object('source', 'pg_cron')
+  );
+  $$
+);
+
+select cron.schedule(
+  'weather-grabber-every-10min',
+  '*/10 * * * *',
+  $$
+  select net.http_post(
+    url := 'https://dyzwgcwzxhkfwgzafetl.supabase.co/functions/v1/weather-grabber',
+    headers := jsonb_build_object(
+      'Content-Type', 'application/json',
+      'x-cron-secret', '<CRON_SECRET>'
+    ),
+    body := jsonb_build_object('source', 'pg_cron')
+  );
+  $$
+);
+
+select cron.schedule(
+  'sea-temperature-grabber-hourly',
+  '0 * * * *',
+  $$
+  select net.http_post(
+    url := 'https://dyzwgcwzxhkfwgzafetl.supabase.co/functions/v1/sea-temperature-grabber',
+    headers := jsonb_build_object(
+      'Content-Type', 'application/json',
+      'x-cron-secret', '<CRON_SECRET>'
     ),
     body := jsonb_build_object('source', 'pg_cron')
   );

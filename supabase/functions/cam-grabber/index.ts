@@ -10,6 +10,35 @@ type FetchResult = {
   extension: string;
 };
 
+type CameraSourceRow = {
+  camera_id: string;
+  camera_name: string;
+  page_url: string;
+  storage_bucket: string | null;
+  keep_last: number | null;
+  active: boolean;
+  sort_order: number | null;
+};
+
+type CameraSource = {
+  cameraId: string;
+  cameraName: string;
+  pageUrl: string;
+  bucket: string;
+  keepLast: number;
+};
+
+type CameraResult = {
+  ok: true;
+  camera_id: string;
+  camera_name: string;
+  ts: string;
+  object_path: string;
+  public_url: string;
+  content_hash: string;
+  bucket: string;
+};
+
 function getRequiredEnv(name: string): string {
   const value = Deno.env.get(name);
   if (!value) {
@@ -36,6 +65,12 @@ function parseKeepLast(value: unknown, fallback: string): number {
 
 function sanitizeCameraId(cameraId: string): string {
   return cameraId.replace(/[^a-zA-Z0-9._-]/g, "_");
+}
+
+function toNonEmptyString(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 function pickImageUrl(html: string, baseUrl: string): string | null {
@@ -136,7 +171,7 @@ async function fetchWithRetry(url: string, headers: HeadersInit): Promise<Respon
 
 async function fetchImage(pageUrl: string): Promise<FetchResult> {
   const headers: HeadersInit = {
-    "User-Agent": "cam-grabber/2.0 (+supabase-edge)",
+    "User-Agent": "cam-grabber/3.0 (+supabase-edge)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/*,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
   };
@@ -157,7 +192,7 @@ async function fetchImage(pageUrl: string): Promise<FetchResult> {
   const html = await pageResponse.text();
   const imageUrl = pickImageUrl(html, pageUrl);
   if (!imageUrl) {
-    throw new Error("No <img src=...> found on PAGE_URL");
+    throw new Error(`No image found on ${pageUrl}`);
   }
 
   const imageResponse = await fetchWithRetry(cacheBust(imageUrl), headers);
@@ -195,6 +230,170 @@ function isAuthorized(request: Request): boolean {
   return false;
 }
 
+function buildFallbackSource(
+  payload: Record<string, unknown>,
+  defaultBucket: string,
+  defaultKeepLast: number,
+): CameraSource | null {
+  const pageUrl = toNonEmptyString(payload.page_url) ?? toNonEmptyString(Deno.env.get("PAGE_URL"));
+  if (!pageUrl) return null;
+
+  const rawCameraId = toNonEmptyString(payload.camera_id) ??
+    toNonEmptyString(Deno.env.get("CAMERA_ID")) ??
+    "default_cam";
+
+  return {
+    cameraId: sanitizeCameraId(rawCameraId),
+    cameraName: toNonEmptyString(payload.camera_name) ?? rawCameraId,
+    pageUrl,
+    bucket: toNonEmptyString(payload.bucket) ?? defaultBucket,
+    keepLast: defaultKeepLast,
+  };
+}
+
+async function loadCameraSources(
+  supabase: ReturnType<typeof createClient>,
+  payload: Record<string, unknown>,
+  defaultBucket: string,
+  defaultKeepLast: number,
+): Promise<CameraSource[]> {
+  const fallbackSource = buildFallbackSource(payload, defaultBucket, defaultKeepLast);
+  const explicitPageUrl = toNonEmptyString(payload.page_url);
+  if (fallbackSource && explicitPageUrl) {
+    return [fallbackSource];
+  }
+
+  const requestedCameraId = toNonEmptyString(payload.camera_id);
+  let query = supabase
+    .from("camera_sources")
+    .select("camera_id, camera_name, page_url, storage_bucket, keep_last, active, sort_order")
+    .eq("active", true)
+    .order("sort_order", { ascending: true })
+    .order("camera_id", { ascending: true });
+
+  if (requestedCameraId) {
+    query = query.eq("camera_id", sanitizeCameraId(requestedCameraId));
+  }
+
+  const { data, error } = await query;
+  if (error) {
+    if (fallbackSource && !requestedCameraId) {
+      console.warn("[cam-grabber] falling back to env configuration:", error.message);
+      return [fallbackSource];
+    }
+    throw new Error(`Failed to load camera sources: ${error.message}`);
+  }
+
+  if (data && data.length > 0) {
+    return (data as CameraSourceRow[]).map((row) => ({
+      cameraId: sanitizeCameraId(row.camera_id),
+      cameraName: row.camera_name,
+      pageUrl: row.page_url,
+      bucket: row.storage_bucket || defaultBucket,
+      keepLast: row.keep_last ?? defaultKeepLast,
+    }));
+  }
+
+  if (fallbackSource && !requestedCameraId) {
+    return [fallbackSource];
+  }
+
+  if (requestedCameraId) {
+    throw new Error(`No active camera source found for ${sanitizeCameraId(requestedCameraId)}`);
+  }
+
+  throw new Error("No camera sources configured");
+}
+
+async function cleanupOldFrames(
+  supabase: ReturnType<typeof createClient>,
+  source: CameraSource,
+): Promise<void> {
+  if (source.keepLast <= 0) {
+    return;
+  }
+
+  while (true) {
+    const oldRows = await supabase
+      .from("camera_frames")
+      .select("id, object_path")
+      .eq("camera_id", source.cameraId)
+      .order("ts", { ascending: false })
+      .range(source.keepLast, source.keepLast + 499);
+
+    if (oldRows.error) {
+      throw new Error(`Cleanup query failed for ${source.cameraId}: ${oldRows.error.message}`);
+    }
+
+    if (!oldRows.data || oldRows.data.length === 0) {
+      return;
+    }
+
+    const oldPaths = oldRows.data.map((row) => row.object_path);
+    const oldIds = oldRows.data.map((row) => row.id);
+
+    const remove = await supabase.storage.from(source.bucket).remove(oldPaths);
+    if (remove.error) {
+      throw new Error(`Storage cleanup failed for ${source.cameraId}: ${remove.error.message}`);
+    }
+
+    const removeRows = await supabase.from("camera_frames").delete().in("id", oldIds);
+    if (removeRows.error) {
+      throw new Error(`DB cleanup failed for ${source.cameraId}: ${removeRows.error.message}`);
+    }
+  }
+}
+
+async function processCameraSource(
+  supabase: ReturnType<typeof createClient>,
+  source: CameraSource,
+): Promise<CameraResult> {
+  const image = await fetchImage(source.pageUrl);
+  const now = new Date();
+  const day = now.toISOString().slice(0, 10);
+  const time = now.toISOString().slice(11, 19).replace(/:/g, "-");
+  const contentHash = await sha256Short(image.bytes);
+  const objectPath = `${source.cameraId}/${day}/${time}_${contentHash}.${image.extension}`;
+
+  const upload = await supabase.storage.from(source.bucket).upload(objectPath, image.bytes, {
+    contentType: image.contentType || `image/${image.extension}`,
+    upsert: false,
+  });
+  if (upload.error) {
+    throw new Error(`Upload failed for ${source.cameraId}: ${upload.error.message}`);
+  }
+
+  const {
+    data: { publicUrl },
+  } = supabase.storage.from(source.bucket).getPublicUrl(objectPath);
+
+  const insert = await supabase.from("camera_frames").insert({
+    camera_id: source.cameraId,
+    ts: now.toISOString(),
+    object_path: objectPath,
+    public_url: publicUrl,
+    content_hash: contentHash,
+  });
+
+  if (insert.error) {
+    await supabase.storage.from(source.bucket).remove([objectPath]);
+    throw new Error(`DB insert failed for ${source.cameraId}: ${insert.error.message}`);
+  }
+
+  await cleanupOldFrames(supabase, source);
+
+  return {
+    ok: true,
+    camera_id: source.cameraId,
+    camera_name: source.cameraName,
+    ts: now.toISOString(),
+    object_path: objectPath,
+    public_url: publicUrl,
+    content_hash: contentHash,
+    bucket: source.bucket,
+  };
+}
+
 Deno.serve(async (request) => {
   if (request.method !== "POST") {
     return json(405, { ok: false, error: "Use POST" });
@@ -209,85 +408,57 @@ Deno.serve(async (request) => {
       ? await request.json().catch(() => ({}))
       : {}) as Record<string, unknown>;
 
-    const pageUrl = String(payload?.page_url ?? getRequiredEnv("PAGE_URL"));
-    const cameraId = sanitizeCameraId(
-      String(payload?.camera_id ?? Deno.env.get("CAMERA_ID") ?? "default_cam"),
-    );
-    const bucket = String(payload?.bucket ?? Deno.env.get("SUPABASE_BUCKET") ?? "camframes");
-    const keepLast = parseKeepLast(payload?.keep_last, Deno.env.get("KEEP_LAST") ?? "100");
+    const defaultBucket = toNonEmptyString(payload.bucket) ??
+      toNonEmptyString(Deno.env.get("SUPABASE_BUCKET")) ??
+      "camframes";
+    const defaultKeepLast = parseKeepLast(payload.keep_last, Deno.env.get("KEEP_LAST") ?? "1000");
 
     const supabaseUrl = getRequiredEnv("SUPABASE_URL");
     const serviceRoleKey = getRequiredEnv("SUPABASE_SERVICE_ROLE_KEY");
     const supabase = createClient(supabaseUrl, serviceRoleKey);
 
-    const image = await fetchImage(pageUrl);
-    const now = new Date();
-    const day = now.toISOString().slice(0, 10);
-    const time = now.toISOString().slice(11, 19).replace(/:/g, "-");
-    const contentHash = await sha256Short(image.bytes);
-    const objectPath = `${cameraId}/${day}/${time}_${contentHash}.${image.extension}`;
+    const sources = await loadCameraSources(supabase, payload, defaultBucket, defaultKeepLast);
+    const results: CameraResult[] = [];
+    const errors: Array<Record<string, string>> = [];
 
-    const upload = await supabase.storage.from(bucket).upload(objectPath, image.bytes, {
-      contentType: image.contentType || `image/${image.extension}`,
-      upsert: false,
-    });
-    if (upload.error) {
-      throw new Error(`Upload failed: ${upload.error.message}`);
-    }
-
-    const {
-      data: { publicUrl },
-    } = supabase.storage.from(bucket).getPublicUrl(objectPath);
-
-    const insert = await supabase.from("camera_frames").insert({
-      camera_id: cameraId,
-      ts: now.toISOString(),
-      object_path: objectPath,
-      public_url: publicUrl,
-      content_hash: contentHash,
-    });
-
-    if (insert.error) {
-      await supabase.storage.from(bucket).remove([objectPath]);
-      throw new Error(`DB insert failed: ${insert.error.message}`);
-    }
-
-    if (keepLast > 0) {
-      const oldRows = await supabase
-        .from("camera_frames")
-        .select("id, object_path")
-        .eq("camera_id", cameraId)
-        .order("ts", { ascending: false })
-        .range(keepLast, keepLast + 499);
-
-      if (oldRows.error) {
-        throw new Error(`Cleanup query failed: ${oldRows.error.message}`);
-      }
-
-      if (oldRows.data && oldRows.data.length > 0) {
-        const oldPaths = oldRows.data.map((row) => row.object_path);
-        const oldIds = oldRows.data.map((row) => row.id);
-
-        const remove = await supabase.storage.from(bucket).remove(oldPaths);
-        if (remove.error) {
-          throw new Error(`Storage cleanup failed: ${remove.error.message}`);
-        }
-
-        const removeRows = await supabase.from("camera_frames").delete().in("id", oldIds);
-        if (removeRows.error) {
-          throw new Error(`DB cleanup failed: ${removeRows.error.message}`);
-        }
+    for (const source of sources) {
+      try {
+        results.push(await processCameraSource(supabase, source));
+      } catch (error) {
+        console.error(`[cam-grabber:${source.cameraId}]`, error);
+        errors.push({
+          camera_id: source.cameraId,
+          camera_name: source.cameraName,
+          error: error instanceof Error ? error.message : "Unknown error",
+        });
       }
     }
 
-    return json(200, {
-      ok: true,
-      ts: now.toISOString(),
-      camera_id: cameraId,
-      object_path: objectPath,
-      public_url: publicUrl,
-      content_hash: contentHash,
-      bucket,
+    if (errors.length === 0) {
+      return json(200, {
+        ok: true,
+        processed_count: results.length,
+        failed_count: 0,
+        results,
+      });
+    }
+
+    if (results.length > 0) {
+      return json(207, {
+        ok: false,
+        partial: true,
+        processed_count: results.length,
+        failed_count: errors.length,
+        results,
+        errors,
+      });
+    }
+
+    return json(500, {
+      ok: false,
+      processed_count: 0,
+      failed_count: errors.length,
+      errors,
     });
   } catch (error) {
     console.error("[cam-grabber]", error);
