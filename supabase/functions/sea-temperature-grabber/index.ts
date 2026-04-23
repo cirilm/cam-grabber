@@ -158,10 +158,32 @@ function getCurrentLocalHour(timeZone: string): number {
   return Number(hour);
 }
 
-function normalizeStationName(cell: HTMLTableCellElement): string {
-  const clone = cell.cloneNode(true) as HTMLTableCellElement;
-  clone.querySelectorAll("sup").forEach((node) => node.remove());
-  return clone.textContent?.replace(/\s+/g, " ").trim() ?? "";
+function decodeHtml(value: string): string {
+  return value
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&quot;/gi, "\"")
+    .replace(/&#39;/gi, "'")
+    .replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCodePoint(Number.parseInt(code, 16)));
+}
+
+function stripHtml(value: string): string {
+  return decodeHtml(value.replace(/<[^>]+>/g, " ")).replace(/\s+/g, " ").trim();
+}
+
+function extractSection(html: string, pattern: RegExp, label: string): string {
+  const match = html.match(pattern);
+  if (!match) {
+    throw new Error(`Could not find ${label}`);
+  }
+  return match[1];
+}
+
+function normalizeStationName(cellHtml: string): string {
+  return stripHtml(cellHtml.replace(/<sup[\s\S]*?<\/sup>/gi, " "));
 }
 
 function toStationSlug(stationName: string): string {
@@ -196,26 +218,21 @@ async function fetchSeaTemperatureObservations(pageUrl: string): Promise<SeaTemp
 
   const response = await fetchWithRetry(pageUrl, headers);
   const html = await response.text();
-  const document = new DOMParser().parseFromString(html, "text/html");
-  if (!document) {
-    throw new Error("Could not parse DHMZ HTML");
-  }
-
-  const heading = document.querySelector("#primary h4")?.textContent?.trim();
-  if (!heading) {
-    throw new Error("Could not find sea temperature heading");
-  }
-
+  const heading = stripHtml(
+    extractSection(html, /<h4>([\s\S]*?Temperatura mora[\s\S]*?)<\/h4>/i, "sea temperature heading"),
+  );
   const localDateParts = parseLocalDateFromHeading(heading);
   const observedDate = formatObservedDate(localDateParts);
-  const table = document.querySelector("#table-aktualni-podaci");
-  if (!table) {
-    throw new Error("Could not find sea temperature table");
-  }
-
-  const headerCells = Array.from(table.querySelectorAll("thead th"))
+  const tableHtml = extractSection(
+    html,
+    /<table[^>]*id="table-aktualni-podaci"[^>]*>([\s\S]*?)<\/table>/i,
+    "sea temperature table",
+  );
+  const headHtml = extractSection(tableHtml, /<thead>([\s\S]*?)<\/thead>/i, "sea temperature header");
+  const bodyHtml = extractSection(tableHtml, /<tbody>([\s\S]*?)<\/tbody>/i, "sea temperature body");
+  const headerCells = Array.from(headHtml.matchAll(/<th[^>]*>([\s\S]*?)<\/th>/gi))
     .slice(1)
-    .map((cell) => Number(cell.textContent?.trim() ?? ""))
+    .map((match) => Number(stripHtml(match[1])))
     .filter((value) => Number.isFinite(value));
 
   if (headerCells.length === 0) {
@@ -225,18 +242,19 @@ async function fetchSeaTemperatureObservations(pageUrl: string): Promise<SeaTemp
   const fetchedAt = new Date().toISOString();
   const observations: SeaTemperatureObservation[] = [];
 
-  for (const row of Array.from(table.querySelectorAll("tbody tr"))) {
-    const cells = Array.from(row.querySelectorAll("td"));
+  for (const rowMatch of bodyHtml.matchAll(/<tr>([\s\S]*?)<\/tr>/gi)) {
+    const rowHtml = rowMatch[1];
+    const cells = Array.from(rowHtml.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)).map((match) => match[1]);
     if (cells.length < 2) continue;
 
-    const stationName = normalizeStationName(cells[0] as HTMLTableCellElement);
+    const stationName = normalizeStationName(cells[0]);
     if (!stationName) continue;
 
     const stationSlug = toStationSlug(stationName);
-    const isBuoySensor = cells[0].querySelector("sup")?.textContent?.trim() === "A";
+    const isBuoySensor = /<sup[^>]*>\s*A\s*<\/sup>/i.test(cells[0]);
 
     for (let index = 1; index < cells.length && index - 1 < headerCells.length; index += 1) {
-      const temperature = parseTemperature(cells[index].textContent ?? "");
+      const temperature = parseTemperature(stripHtml(cells[index]));
       if (temperature === null) continue;
 
       const observedHour = headerCells[index - 1];
